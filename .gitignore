@@ -1,0 +1,6 @@
+/target
+*.wasm
+*.zip
+*.bundle
+.DS_Store
+.build
