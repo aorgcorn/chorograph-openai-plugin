@@ -240,8 +240,37 @@ impl OpenAIPlugin {
 
 #[chorograph_plugin]
 pub fn init() {
+    // Pre-populate fields from previously saved UserDefaults values.
+    let base_url = get_user_default("openaiCompatibleBaseURL").unwrap_or_default();
+    let model = get_user_default("openaiCompatibleModel").unwrap_or_default();
+    // API key is intentionally not pre-populated (securefield shows blank for security).
+
     let ui = json!([
-        { "type": "label", "text": "OpenAI Compatible (Rust WASM)" }
+        { "type": "label", "text": "OpenAI Compatible" },
+        {
+            "type": "textfield",
+            "id": "baseUrl",
+            "label": "Base URL",
+            "placeholder": "http://localhost:11434",
+            "value": base_url,
+            "defaults_key": "openaiCompatibleBaseURL"
+        },
+        {
+            "type": "securefield",
+            "id": "apiKey",
+            "label": "API Key",
+            "placeholder": "sk-... (leave blank for local models)",
+            "value": "",
+            "defaults_key": "openaiCompatibleAPIKey"
+        },
+        {
+            "type": "textfield",
+            "id": "model",
+            "label": "Model",
+            "placeholder": "gpt-4o",
+            "value": model,
+            "defaults_key": "openaiCompatibleModel"
+        }
     ]);
     push_ui(&ui.to_string());
 }
