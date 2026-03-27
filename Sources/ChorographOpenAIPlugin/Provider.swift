@@ -31,7 +31,7 @@ actor OpenAICompatibleProvider: AIProvider {
     // MARK: - Internal state
 
     private let localAuth: LocalAuthManager
-    private var eventContinuation: AsyncStream<any ProviderEvent>.Continuation?
+    private var eventContinuation: AsyncStream<any PluginEvent>.Continuation?
     private var isStopped = false
     private var sessionResults: [String: String] = [:]
 
@@ -123,10 +123,10 @@ actor OpenAICompatibleProvider: AIProvider {
 
     // MARK: - Event stream
 
-    func eventStream() -> AsyncStream<any ProviderEvent> {
+    func eventStream() -> AsyncStream<any PluginEvent> {
         isStopped = false
-        var capturedCont: AsyncStream<any ProviderEvent>.Continuation?
-        let stream = AsyncStream<any ProviderEvent> { cont in
+        var capturedCont: AsyncStream<any PluginEvent>.Continuation?
+        let stream = AsyncStream<any PluginEvent> { cont in
             capturedCont = cont
         }
         self.eventContinuation = capturedCont
@@ -148,7 +148,7 @@ actor OpenAICompatibleProvider: AIProvider {
         baseURL: String,
         apiKey: String,
         model: String,
-        continuation: AsyncStream<any ProviderEvent>.Continuation?
+        continuation: AsyncStream<any PluginEvent>.Continuation?
     ) async {
         let urlString = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/v1/chat/completions"
         guard let url = URL(string: urlString) else {
