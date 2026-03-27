@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "chorograph-openai-plugin-rust"
-version = "1.0.0"
+version = "1.0.5"
 dependencies = [
  "chorograph-plugin-sdk-rust",
  "serde",

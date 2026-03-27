@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
-// OpenAI-compatible REST API plugin (WASM path)
+// OpenAI-compatible REST API plugin (WASM path) — streaming via SSE
 // ---------------------------------------------------------------------------
 // Reads configuration from the host UserDefaults via `get_user_default`:
 //   "openaiCompatibleBaseURL"  — base URL, e.g. "http://localhost:11434"
@@ -19,35 +19,30 @@ struct OpenAIMessage {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAIToolFunction {
-    name: String,
-    #[allow(dead_code)]
-    arguments: String,
-}
+// ---------------------------------------------------------------------------
+// Streaming response types (for `"stream": true`)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct OpenAIToolCall {
-    function: OpenAIToolFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIChoiceMessage {
+struct OpenAIStreamDelta {
     #[serde(default)]
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamChoice {
+    delta: OpenAIStreamDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamChunk {
     #[serde(default)]
-    tool_calls: Option<Vec<OpenAIToolCall>>,
+    choices: Vec<OpenAIStreamChoice>,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAIChoice {
-    message: OpenAIChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIResponse {
-    choices: Vec<OpenAIChoice>,
-}
+// ---------------------------------------------------------------------------
+// Non-streaming response types (used by fetch_models)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct OpenAIModel {
@@ -80,28 +75,39 @@ impl OpenAIPlugin {
         }
     }
 
-    /// POST to /v1/chat/completions and return the assistant reply text.
-    /// Emits a ToolCall event before the request and, if the model returns
-    /// tool_calls in the response, emits one ToolCall per function call.
-    fn call_chat_completions(
+    /// Stream a chat completion, emitting one `StreamingDelta` per token.
+    ///
+    /// Uses `"stream": true` and the SSE host API.  Emits a `ToolCall` log
+    /// line before the request so the activity panel shows what's happening.
+    fn stream_chat_completions(
         session_id: &str,
         base_url: &str,
         api_key: &str,
         model: &str,
         messages: Vec<OpenAIMessage>,
-    ) -> Result<String> {
+    ) {
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
-        let body = serde_json::to_string(&json!({
+        let body = match serde_json::to_string(&json!({
             "model": model,
             "messages": messages,
-            "stream": false
-        }))
-        .map_err(|e| PluginError::SerializationError(e.to_string()))?;
+            "stream": true
+        })) {
+            Ok(b) => b,
+            Err(e) => {
+                push_ai_event(
+                    session_id,
+                    &AIEvent::Error {
+                        message: format!("Failed to serialise request: {}", e),
+                    },
+                );
+                return;
+            }
+        };
 
         let mut headers: Vec<(&str, String)> = vec![
             ("Content-Type", "application/json".to_string()),
-            ("Accept", "application/json".to_string()),
+            ("Accept", "text/event-stream".to_string()),
         ];
         let auth_value;
         if let Some(auth) = Self::auth_header(api_key) {
@@ -112,48 +118,73 @@ impl OpenAIPlugin {
         let header_refs: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        // Emit a tool-call entry so the activity log shows what we're doing.
+        // Log what we're about to call.
         push_tool_call(&format!(
             "CALL {} → {}",
             model,
             base_url.trim_end_matches('/')
         ));
 
-        let resp = http_post(&url, Some(&header_refs), &body)?;
-
-        if resp.status < 200 || resp.status >= 300 {
-            return Err(PluginError::Other(format!(
-                "OpenAI API returned HTTP {}: {}",
-                resp.status, resp.body
-            )));
-        }
-
-        let parsed: OpenAIResponse = serde_json::from_str(&resp.body).map_err(|e| {
-            PluginError::SerializationError(format!("Failed to parse response: {}", e))
-        })?;
-
-        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
-            PluginError::Other("OpenAI response contained no choices".to_string())
-        })?;
-
-        // If the model used function/tool calling, emit each call as a ToolCall event.
-        if let Some(tool_calls) = choice.message.tool_calls {
-            for tc in &tool_calls {
-                push_tool_call(&format!("TOOL {}", tc.function.name));
+        let handle = match sse_post(&url, Some(&header_refs), &body) {
+            Ok(h) => h,
+            Err(e) => {
+                push_ai_event(
+                    session_id,
+                    &AIEvent::Error {
+                        message: format!("SSE connection failed: {}", e),
+                    },
+                );
+                return;
             }
-            // Summarise tool calls as the assistant reply text if there's no text content.
-            let summary = tool_calls
-                .iter()
-                .map(|tc| format!("{}({})", tc.function.name, tc.function.arguments))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Ok(choice.message.content.unwrap_or(summary));
-        }
+        };
 
-        choice
-            .message
-            .content
-            .ok_or_else(|| PluginError::Other("OpenAI response had no content".to_string()))
+        // Iterate over SSE lines until [DONE].
+        let sid = session_id.to_string();
+        for_each_sse_line(handle, move |line| {
+            // SSE lines look like:  data: <json>
+            // or the terminator:    data: [DONE]
+            let data = match line.strip_prefix("data: ") {
+                Some(d) => d.trim(),
+                None => return true, // skip comment/event/retry lines
+            };
+
+            if data == "[DONE]" {
+                return false; // stop iterating
+            }
+
+            if data.is_empty() {
+                return true;
+            }
+
+            match serde_json::from_str::<OpenAIStreamChunk>(data) {
+                Ok(chunk) => {
+                    if let Some(choice) = chunk.choices.into_iter().next() {
+                        if let Some(text) = choice.delta.content {
+                            if !text.is_empty() {
+                                push_ai_event(
+                                    &sid,
+                                    &AIEvent::StreamingDelta {
+                                        session_id: sid.clone(),
+                                        text,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Log but don't abort — some providers send non-JSON lines.
+                    log!(
+                        "[OpenAI Plugin] failed to parse SSE chunk: {} — {:?}",
+                        data,
+                        e
+                    );
+                }
+            }
+
+            true // continue
+        });
+        log!("[OpenAI Plugin] SSE loop done");
     }
 
     /// GET /v1/models and return model IDs.
@@ -249,32 +280,18 @@ impl OpenAIPlugin {
         }
 
         log!(
-            "[OpenAI Plugin] Calling {} model={} messages={}",
+            "[OpenAI Plugin] Calling {} model={} messages={} (streaming)",
             base_url,
             model,
             messages.len()
         );
 
-        match Self::call_chat_completions(session_id, &base_url, &api_key, &model, messages) {
-            Ok(text) => {
-                push_ai_event(
-                    session_id,
-                    &AIEvent::StreamingDelta {
-                        session_id: session_id.to_string(),
-                        text,
-                    },
-                );
-            }
-            Err(e) => {
-                push_ai_event(
-                    session_id,
-                    &AIEvent::Error {
-                        message: format!("OpenAI request failed: {:?}", e),
-                    },
-                );
-            }
-        }
+        Self::stream_chat_completions(session_id, &base_url, &api_key, &model, messages);
 
+        log!(
+            "[OpenAI Plugin] stream complete, emitting TurnCompleted sid={}",
+            &session_id[..session_id.len().min(8)]
+        );
         push_ai_event(
             session_id,
             &AIEvent::TurnCompleted {
@@ -286,10 +303,63 @@ impl OpenAIPlugin {
 
 #[chorograph_plugin]
 pub fn init() {
-    // Pre-populate fields from previously saved UserDefaults values.
     let base_url = get_user_default("openaiCompatibleBaseURL").unwrap_or_default();
-    let model = get_user_default("openaiCompatibleModel").unwrap_or_default();
-    // API key is intentionally not pre-populated (securefield shows blank for security).
+    let api_key = get_user_default("openaiCompatibleAPIKey").unwrap_or_default();
+    let saved_model = get_user_default("openaiCompatibleModel").unwrap_or_default();
+
+    // Try to populate the model picker from /v1/models if a base URL is configured.
+    let model_component = if !base_url.is_empty() {
+        match OpenAIPlugin::fetch_models(&base_url, &api_key) {
+            Ok(models) if !models.is_empty() => {
+                // Use the saved model as the selected value; fall back to the first model.
+                let selected = if models.contains(&saved_model) {
+                    saved_model.clone()
+                } else {
+                    models[0].clone()
+                };
+                // Persist the resolved selection so handle_chat picks it up immediately.
+                // (Only update UserDefaults when the saved value is absent or stale.)
+                if saved_model.is_empty() || !models.contains(&saved_model) {
+                    // Note: we can only write via the defaults_key mechanism on user
+                    // interaction; just keep the saved_model unchanged and let the
+                    // picker selection drive writes on first user change.
+                }
+                let options: Vec<serde_json::Value> = models
+                    .iter()
+                    .map(|id| json!({ "value": id, "label": id }))
+                    .collect();
+                json!({
+                    "type": "picker",
+                    "id": "model",
+                    "label": "Model",
+                    "options": options,
+                    "selected": selected,
+                    "defaults_key": "openaiCompatibleModel"
+                })
+            }
+            _ => {
+                // Fetch failed or returned empty — fall back to free-text entry.
+                json!({
+                    "type": "textfield",
+                    "id": "model",
+                    "label": "Model",
+                    "placeholder": "gpt-4o",
+                    "value": saved_model,
+                    "defaults_key": "openaiCompatibleModel"
+                })
+            }
+        }
+    } else {
+        // No base URL yet — plain textfield.
+        json!({
+            "type": "textfield",
+            "id": "model",
+            "label": "Model",
+            "placeholder": "gpt-4o",
+            "value": saved_model,
+            "defaults_key": "openaiCompatibleModel"
+        })
+    };
 
     let ui = json!([
         { "type": "label", "text": "OpenAI Compatible" },
@@ -309,14 +379,7 @@ pub fn init() {
             "value": "",
             "defaults_key": "openaiCompatibleAPIKey"
         },
-        {
-            "type": "textfield",
-            "id": "model",
-            "label": "Model",
-            "placeholder": "gpt-4o",
-            "value": model,
-            "defaults_key": "openaiCompatibleModel"
-        }
+        model_component
     ]);
     push_ui(&ui.to_string());
 }
