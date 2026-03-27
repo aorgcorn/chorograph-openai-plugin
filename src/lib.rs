@@ -20,8 +20,28 @@ struct OpenAIMessage {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAIToolFunction {
+    name: String,
+    #[allow(dead_code)]
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIToolCall {
+    function: OpenAIToolFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChoiceMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAIToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAIChoice {
-    message: OpenAIMessage,
+    message: OpenAIChoiceMessage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +81,10 @@ impl OpenAIPlugin {
     }
 
     /// POST to /v1/chat/completions and return the assistant reply text.
+    /// Emits a ToolCall event before the request and, if the model returns
+    /// tool_calls in the response, emits one ToolCall per function call.
     fn call_chat_completions(
+        session_id: &str,
         base_url: &str,
         api_key: &str,
         model: &str,
@@ -89,6 +112,13 @@ impl OpenAIPlugin {
         let header_refs: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
+        // Emit a tool-call entry so the activity log shows what we're doing.
+        push_tool_call(&format!(
+            "CALL {} → {}",
+            model,
+            base_url.trim_end_matches('/')
+        ));
+
         let resp = http_post(&url, Some(&header_refs), &body)?;
 
         if resp.status < 200 || resp.status >= 300 {
@@ -102,12 +132,28 @@ impl OpenAIPlugin {
             PluginError::SerializationError(format!("Failed to parse response: {}", e))
         })?;
 
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| PluginError::Other("OpenAI response contained no choices".to_string()))
+        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            PluginError::Other("OpenAI response contained no choices".to_string())
+        })?;
+
+        // If the model used function/tool calling, emit each call as a ToolCall event.
+        if let Some(tool_calls) = choice.message.tool_calls {
+            for tc in &tool_calls {
+                push_tool_call(&format!("TOOL {}", tc.function.name));
+            }
+            // Summarise tool calls as the assistant reply text if there's no text content.
+            let summary = tool_calls
+                .iter()
+                .map(|tc| format!("{}({})", tc.function.name, tc.function.arguments))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(choice.message.content.unwrap_or(summary));
+        }
+
+        choice
+            .message
+            .content
+            .ok_or_else(|| PluginError::Other("OpenAI response had no content".to_string()))
     }
 
     /// GET /v1/models and return model IDs.
@@ -209,7 +255,7 @@ impl OpenAIPlugin {
             messages.len()
         );
 
-        match Self::call_chat_completions(&base_url, &api_key, &model, messages) {
+        match Self::call_chat_completions(session_id, &base_url, &api_key, &model, messages) {
             Ok(text) => {
                 push_ai_event(
                     session_id,
